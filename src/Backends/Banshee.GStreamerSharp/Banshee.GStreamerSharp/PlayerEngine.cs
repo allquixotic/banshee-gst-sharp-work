@@ -3,8 +3,10 @@
 //
 // Author:
 //   Gabriel Burt <gburt@novell.com>
+//   Sean McNamara <smcnam@gmail.com
 //
 // Copyright (C) 2010 Novell, Inc.
+// Copyright (C) 2010 Sean McNamara
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -28,6 +30,7 @@
 
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -36,6 +39,7 @@ using Mono.Unix;
 
 using Gst;
 using Gst.BasePlugins;
+using Gst.Base;
 
 using Hyena;
 using Hyena.Data;
@@ -53,64 +57,89 @@ namespace Banshee.GStreamerSharp
     {
         Pipeline pipeline;
         PlayBin2 playbin;
+        private MyBinType audiobin;
+        private BinList<Element> filterbin;
+        private Element audiosink;
+        private Element queue;
+        private readonly List<Bin> filterList = new List<Bin> ();
+        private readonly GhostPad audiobinsink = new GhostPad ("sink", PadDirection.Sink);
 
         public PlayerEngine ()
         {
             Console.WriteLine ("Gst# PlayerEngine ctor - completely experimental, still a WIP");
             Gst.Application.Init ();
+            
+            //Making early-bound elements
             pipeline = new Pipeline ();
             playbin = new PlayBin2 ();
+            audiobin = new MyBinType ("audiobin");
+            filterbin = new BinList<Element> ("filterbin");
+            
+            //Making late-bound elements (not currently bound by gst-sharp)
+            audiosink = ElementFactory.Make ("gconfaudiosink", "thesink");
+            if (audiosink == null)
+                audiosink = ElementFactory.Make ("autoaudiosink", "thesink");
+            queue = ElementFactory.Make ("queue", "audioqueue");
+            
+            //Adding, linking, and padding
+            filterbin.Add (queue);
+            audiobin.Add (filterbin.GetBin (), audiosink);
+            filterbin.GetSourceGhostPad ().Link (audiosink.GetStaticPad ("sink"));
+            audiobinsink.SetTarget (filterbin.GetSinkGhostPad ());
+            audiobin.AddPadHack (audiobinsink);
+            
+            playbin.AudioSink = audiobin;
             pipeline.Add (playbin);
-
+            
             pipeline.Bus.AddWatch (OnBusMessage);
-
+            
             Banshee.ServiceStack.Application.RunTimeout (200, delegate {
                 OnEventChanged (PlayerEvent.Iterate);
                 return true;
             });
-
+            
             OnStateChanged (PlayerState.Ready);
         }
 
         private bool OnBusMessage (Bus bus, Message msg)
         {
             switch (msg.Type) {
-                case MessageType.Eos:
-                    Close (false);
-                    OnEventChanged (PlayerEvent.EndOfStream);
-                    OnEventChanged (PlayerEvent.RequestNextTrack);
-                    break;
-                case MessageType.StateChanged:
-                    State old_state, new_state, pending_state;
-                    msg.ParseStateChanged (out old_state, out new_state, out pending_state);
-
-                    HandleStateChange (old_state, new_state, pending_state);
-
-                    break;
-                case MessageType.Buffering:
-                    int buffer_percent;
-                    msg.ParseBuffering (out buffer_percent);
-
-                    HandleBuffering (buffer_percent);
-                    break;
-                case MessageType.Tag:
-                    Pad pad;
-                    TagList tag_list;
-                    msg.ParseTag (out pad, out tag_list);
-
-                    HandleTag (pad, tag_list);
-
-                    break;
-                case MessageType.Error:
-                    Enum error_type;
-                    string err_msg, debug;
-                    msg.ParseError (out error_type, out err_msg, out debug);
-
-                    // TODO: What to do with the error?
-
-                    break;
+            case MessageType.Eos:
+                Close (false);
+                OnEventChanged (PlayerEvent.EndOfStream);
+                OnEventChanged (PlayerEvent.RequestNextTrack);
+                break;
+            case MessageType.StateChanged:
+                State old_state, new_state, pending_state;
+                msg.ParseStateChanged (out old_state, out new_state, out pending_state);
+                
+                HandleStateChange (old_state, new_state, pending_state);
+                
+                break;
+            case MessageType.Buffering:
+                int buffer_percent;
+                msg.ParseBuffering (out buffer_percent);
+                
+                HandleBuffering (buffer_percent);
+                break;
+            case MessageType.Tag:
+                Pad pad;
+                TagList tag_list;
+                msg.ParseTag (out pad, out tag_list);
+                
+                HandleTag (pad, tag_list);
+                
+                break;
+            case MessageType.Error:
+                Enum error_type;
+                string err_msg, debug;
+                msg.ParseError (out error_type, out err_msg, out debug);
+                
+                // TODO: What to do with the error?
+                
+                break;
             }
-
+            
             return true;
         }
 
@@ -139,15 +168,15 @@ namespace Banshee.GStreamerSharp
                 if (String.IsNullOrEmpty (tag)) {
                     continue;
                 }
-
+                
                 if (tag_list.GetTagSize (tag) < 1) {
                     continue;
                 }
-
+                
                 List tags = tag_list.GetTag (tag);
-
+                
                 foreach (object o in tags) {
-                    OnTagFound (new StreamTag () { Name = tag, Value = o });
+                    OnTagFound (new StreamTag { Name = tag, Value = o });
                 }
             }
         }
@@ -176,7 +205,7 @@ namespace Banshee.GStreamerSharp
         }
 
         public override ushort Volume {
-            get { return (ushort) Math.Round (playbin.Volume * 100.0); }
+            get { return (ushort)Math.Round (playbin.Volume * 100.0); }
             set { playbin.Volume = (value / 100.0); }
         }
 
@@ -189,27 +218,25 @@ namespace Banshee.GStreamerSharp
             get {
                 long pos;
                 playbin.QueryPosition (ref query_format, out pos);
-                return (uint) ((ulong)pos / Gst.Clock.MSecond);
+                return (uint)((ulong)pos / Gst.Clock.MSecond);
             }
-            set {
-                playbin.Seek (Format.Time, SeekFlags.Accurate, (long)(value * Gst.Clock.MSecond));
-            }
+            set { playbin.Seek (Format.Time, SeekFlags.Accurate, (long)(value * Gst.Clock.MSecond)); }
         }
 
         public override uint Length {
             get {
                 long duration;
                 playbin.QueryDuration (ref query_format, out duration);
-                return (uint) ((ulong)duration / Gst.Clock.MSecond);
+                return (uint)((ulong)duration / Gst.Clock.MSecond);
             }
         }
 
-        private static string [] source_capabilities = { "file", "http", "cdda" };
+        private static string[] source_capabilities = { "file", "http", "cdda" };
         public override IEnumerable SourceCapabilities {
             get { return source_capabilities; }
         }
 
-        private static string [] decoder_capabilities = { "ogg", "wma", "asf", "flac", "mp3", "" };
+        private static string[] decoder_capabilities = { "ogg", "wma", "asf", "flac", "mp3", "mp4", "m4a", "" };
         public override IEnumerable ExplicitDecoderCapabilities {
             get { return decoder_capabilities; }
         }
@@ -228,6 +255,54 @@ namespace Banshee.GStreamerSharp
 
         public override VideoDisplayContextType VideoDisplayContextType {
             get { return VideoDisplayContextType.Unsupported; }
+        }
+
+        public override object AddFilterElement (string elementClass, string name)
+        {
+            if (elementClass != null && elementClass.Length > 0 && name != null && name.Length > 0) {
+                Bin parsed = (Bin)Gst.Parse.BinFromDescription ("audioconvert ! " + elementClass + " name=" + name + " ! audioconvert", true);
+                parsed.Name = name + "bin";
+                
+                filterbin.Add (parsed);
+                filterList.Add (parsed);
+                
+                IEnumerator ie = parsed.ElementsSorted.GetEnumerator ();
+                ie.MoveNext ();
+                ie.MoveNext ();
+                return ie.Current;
+            } else {
+                return null;
+            }
+        }
+
+        public override bool RemoveFilterElement (object elem)
+        {
+            if (name is Element) {
+                Bin found = null;
+                Element e = (Element)name;
+                foreach (Bin b in filterList) {
+                    IEnumerator enu = b.ElementsRecurse.GetEnumerator ();
+                    foreach (object o in enu) {
+                        if (o is Element && ((Element)o) == e) {
+                            found = b;
+                            break;
+                        }
+                    }
+                    if (found != null) {
+                        break;
+                    }
+                }
+                
+                if (found == null) {
+                    return false;
+                } else {
+                    filterbin.Remove (found);
+                    filterList.Remove (found);
+                    return true;
+                }
+            } else {
+                return false;
+            }
         }
     }
 }
